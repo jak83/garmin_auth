@@ -23,8 +23,14 @@ Tokens live in one place shared with every other consumer, including the
 Garmin MCP server:
     GARMINTOKENS, else ~/.garminconnect
 
-Set GARMIN_TOKEN_URL and GARMIN_BRIDGE_SECRET to also share the session across
-machines; see garmin_auth.bridge.
+There are two ways to share one session across machines:
+
+1. Token service (preferred). Set TOKEN_SERVICE_URL and TOKEN_SERVICE_KEY and
+   the server hands out short-lived access tokens. This client then holds
+   nothing long-lived and cannot rotate anything, which removes the race
+   entirely - see garmin_auth.service.
+2. Token bridge (legacy). Set GARMIN_TOKEN_URL and GARMIN_BRIDGE_SECRET and
+   this client manages and rotates the tokens itself - see garmin_auth.bridge.
 """
 import atexit
 import logging
@@ -32,11 +38,11 @@ import os
 import sys
 from pathlib import Path
 
-from . import bridge
+from . import bridge, service
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["get_client", "token_store", "publish_tokens", "bridge"]
+__all__ = ["get_client", "token_store", "publish_tokens", "bridge", "service"]
 
 DEFAULT_TOKEN_STORE = "~/.garminconnect"
 
@@ -110,6 +116,8 @@ def get_client(email=None, password=None, tokenstore=None, prompt_mfa=None,
     Return an authenticated garminconnect.Garmin client.
 
     Resolution order:
+        0. the token service, if configured - it issues a short-lived access
+           token and keeps the refresh token to itself,
         1. tokens pulled from the bridge (the freshest copy wins, because
            refresh tokens rotate and only the newest one works),
         2. tokens already in the local store,
@@ -129,6 +137,14 @@ def get_client(email=None, password=None, tokenstore=None, prompt_mfa=None,
         Exception: when no tokens work and no credentials are available.
     """
     from garminconnect import Garmin
+
+    # 0. The token service owns the refresh token; we only borrow an access
+    #    token. Nothing is stored locally, so nothing here can go stale.
+    if service.is_configured():
+        try:
+            return service.garmin_client(prompt_mfa=prompt_mfa)
+        except Exception as e:
+            logger.warning(f"Token service unusable, falling back: {e}")
 
     store = token_store(tokenstore)
     store.mkdir(parents=True, exist_ok=True)

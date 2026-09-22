@@ -353,3 +353,104 @@ class TestDoesNotClobberNewerLocalTokens(StoreTestCase):
                          1790000000.0)
         self.assertEqual(bridge.access_expiry({}), 0.0)
         self.assertEqual(bridge.access_expiry({"di_token": "junk"}), 0.0)
+
+
+SERVICE_ENV = {
+    "TOKEN_SERVICE_URL": "https://klaanisodat.fi/auth",
+    "TOKEN_SERVICE_KEY": "machine-key",
+}
+
+
+class TestServiceMode(StoreTestCase):
+    """
+    In service mode the server keeps the refresh token, so this client holds
+    nothing long-lived and cannot rotate anything.
+    """
+
+    def test_off_unless_both_variables_are_set(self):
+        from garmin_auth import service
+        for env in ({}, {"TOKEN_SERVICE_URL": "x"}, {"TOKEN_SERVICE_KEY": "y"}):
+            with patch.dict(os.environ, env, clear=True):
+                self.assertFalse(service.is_configured(), env)
+        with patch.dict(os.environ, SERVICE_ENV, clear=True):
+            self.assertTrue(service.is_configured())
+
+    def test_fetch_sends_the_machine_key(self):
+        from garmin_auth import service
+        payload = {"access_token": "a" * 600, "expires_at": 123}
+        with patch.dict(os.environ, SERVICE_ENV, clear=True):
+            with patch("requests.get", return_value=_response(200, payload)) as mock_get:
+                got = service.fetch_access_token("garmin")
+
+        url, = mock_get.call_args[0]
+        self.assertEqual(url, "https://klaanisodat.fi/auth/garmin/access-token")
+        self.assertEqual(mock_get.call_args[1]["headers"]["Authorization"],
+                         "Bearer machine-key")
+        self.assertEqual(got["access_token"], payload["access_token"])
+
+    def test_service_errors_are_explained(self):
+        from garmin_auth import service
+        cases = {401: "rejected", 404: "no garmin token", 503: "expired"}
+        with patch.dict(os.environ, SERVICE_ENV, clear=True):
+            for status, expected in cases.items():
+                with patch("requests.get", return_value=_response(status)):
+                    with self.assertRaises(RuntimeError) as cm:
+                        service.fetch_access_token("garmin")
+                self.assertIn(expected, str(cm.exception).lower(), status)
+
+    def test_token_is_never_written_to_disk(self):
+        """
+        The access token is handed to login() as a string, which garminconnect
+        treats as token data rather than a path when it is over 512 chars.
+        """
+        from garmin_auth import service
+        token = "h." + "a" * 900 + ".s"
+        captured = {}
+
+        class FakeGarmin:
+            def __init__(self, prompt_mfa=None):
+                self.display_name = "tester"
+
+            def login(self, tokenstore=None):
+                captured["tokenstore"] = tokenstore
+
+        module = MagicMock(Garmin=FakeGarmin)
+        with patch.dict(sys.modules, {"garminconnect": module}):
+            with patch.dict(os.environ, SERVICE_ENV, clear=True):
+                with patch("requests.get",
+                           return_value=_response(200, {"access_token": token})):
+                    client = service.garmin_client()
+
+        self.assertEqual(client.display_name, "tester")
+        blob = captured["tokenstore"]
+        self.assertGreater(len(blob), 512, "would be treated as a file path")
+        parsed = json.loads(blob)
+        self.assertEqual(parsed["di_token"], token)
+        # The whole point: no refresh token reaches the client.
+        self.assertNotIn("di_refresh_token", parsed)
+        self.assertFalse(bridge.token_file(self.store).exists())
+
+    def test_get_client_prefers_the_service(self):
+        sentinel = MagicMock(display_name="from-service")
+        with patch.dict(os.environ, SERVICE_ENV, clear=True):
+            with patch.object(garmin_auth.service, "garmin_client",
+                              return_value=sentinel) as mock_service:
+                client = garmin_auth.get_client(tokenstore=self.store)
+
+        self.assertIs(client, sentinel)
+        mock_service.assert_called_once()
+
+    def test_get_client_falls_back_when_the_service_is_down(self):
+        """A server outage must not stop a sync local tokens could serve."""
+        self._write()
+        fake_client = MagicMock(display_name="local")
+        module = MagicMock(Garmin=MagicMock(return_value=fake_client))
+
+        with patch.dict(sys.modules, {"garminconnect": module}):
+            with patch.dict(os.environ, SERVICE_ENV, clear=True):
+                with patch.object(garmin_auth.service, "garmin_client",
+                                  side_effect=RuntimeError("service down")):
+                    client = garmin_auth.get_client(tokenstore=self.store)
+
+        self.assertIs(client, fake_client)
+        fake_client.login.assert_called_once()
