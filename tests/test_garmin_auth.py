@@ -287,3 +287,69 @@ class TestGetClient(StoreTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _jwt(exp: int) -> str:
+    """Build a di_token-shaped JWT whose exp claim is `exp`."""
+    import base64 as b64
+    payload = b64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
+    return f"header.{payload}.signature"
+
+
+def _tokens_expiring(exp: int, refresh="ref"):
+    return {"di_token": _jwt(exp), "di_refresh_token": refresh,
+            "di_client_id": "client"}
+
+
+class TestDoesNotClobberNewerLocalTokens(StoreTestCase):
+    """
+    The Garmin MCP server shares this token store and refreshes without
+    publishing. Overwriting its rotation with an older bridge copy would kill
+    both, since the rotation already invalidated the bridge's refresh token.
+    """
+
+    def test_newer_local_is_kept_and_published(self):
+        import time
+        newer = _tokens_expiring(int(time.time()) + 86400, refresh="local-new")
+        older = _tokens_expiring(int(time.time()) + 3600, refresh="bridge-old")
+        bridge.token_file(self.store).write_text(json.dumps(newer))
+
+        with patch.dict(os.environ, BRIDGE_ENV, clear=True):
+            with patch("requests.get", return_value=_response(200, older)):
+                with patch("requests.put", return_value=_response(200)) as mock_put:
+                    self.assertFalse(bridge.fetch_tokens(self.store))
+
+        # Local untouched...
+        kept = json.loads(bridge.token_file(self.store).read_text())
+        self.assertEqual(kept["di_refresh_token"], "local-new")
+        # ...and pushed, so the other machines recover.
+        self.assertEqual(mock_put.call_args[1]["json"]["di_refresh_token"],
+                         "local-new")
+
+    def test_newer_bridge_still_wins(self):
+        import time
+        older = _tokens_expiring(int(time.time()) + 3600, refresh="local-old")
+        newer = _tokens_expiring(int(time.time()) + 86400, refresh="bridge-new")
+        bridge.token_file(self.store).write_text(json.dumps(older))
+
+        with patch.dict(os.environ, BRIDGE_ENV, clear=True):
+            with patch("requests.get", return_value=_response(200, newer)):
+                self.assertTrue(bridge.fetch_tokens(self.store))
+
+        got = json.loads(bridge.token_file(self.store).read_text())
+        self.assertEqual(got["di_refresh_token"], "bridge-new")
+
+    def test_unreadable_expiry_does_not_block_the_bridge(self):
+        """An opaque token must not make us prefer a stale local copy."""
+        bridge.token_file(self.store).write_text(json.dumps(
+            {"di_token": "not-a-jwt", "di_refresh_token": "x", "di_client_id": "c"}))
+
+        with patch.dict(os.environ, BRIDGE_ENV, clear=True):
+            with patch("requests.get", return_value=_response(200, TOKENS)):
+                self.assertTrue(bridge.fetch_tokens(self.store))
+
+    def test_expiry_of_a_real_looking_token(self):
+        self.assertEqual(bridge.access_expiry(_tokens_expiring(1790000000)),
+                         1790000000.0)
+        self.assertEqual(bridge.access_expiry({}), 0.0)
+        self.assertEqual(bridge.access_expiry({"di_token": "junk"}), 0.0)

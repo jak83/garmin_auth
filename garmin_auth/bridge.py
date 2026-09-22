@@ -18,6 +18,7 @@ invalidates the copy the others hold, so the bridge cannot be a write-once
 cache. Callers must fetch before use and push after any refresh; see
 garmin_auth.get_client, which does both.
 """
+import base64
 import hashlib
 import json
 import logging
@@ -91,6 +92,35 @@ def fingerprint(token_dir) -> str:
         return ""
 
 
+def _read_local(token_dir) -> dict:
+    """Read the stored tokens, or {} when there are none."""
+    path = token_file(token_dir)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def access_expiry(tokens: dict) -> float:
+    """
+    Return the access token's expiry as a unix timestamp, 0.0 if unknown.
+
+    di_token is a JWT, so its exp claim tells us which of two token sets is
+    the newer one without having to ask Garmin.
+    """
+    token = tokens.get("di_token") if isinstance(tokens, dict) else None
+    if not token:
+        return 0.0
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
+    except Exception:
+        return 0.0
+
+
 def fetch_tokens(token_dir) -> bool:
     """
     Download tokens from the bridge into token_dir.
@@ -122,6 +152,18 @@ def fetch_tokens(token_dir) -> bool:
 
     if not isinstance(payload, dict) or not payload.get("di_token"):
         logger.warning("Bridge returned no usable Garmin tokens; using local tokens.")
+        return False
+
+    # Never overwrite a newer local token. Other tools share this store - the
+    # Garmin MCP server uses garminconnect directly - and they rotate tokens
+    # without publishing. Clobbering their rotation with an older bridge copy
+    # would kill both, since the rotation already invalidated the bridge's
+    # refresh token. Publish the newer local copy instead.
+    local = _read_local(token_dir)
+    if local and access_expiry(local) > access_expiry(payload):
+        logger.info("Local Garmin tokens are newer than the bridge; another tool "
+                    "refreshed them. Keeping them and publishing to the bridge.")
+        push_tokens(token_dir)
         return False
 
     path = token_file(token_dir)
